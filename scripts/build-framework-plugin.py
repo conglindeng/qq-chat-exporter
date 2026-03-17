@@ -107,9 +107,18 @@ def main():
     print()
     
     # Copy QCE plugin
-    print("[5/8] Copying QCE plugin...")
+    print("[5/8] Copying plugins...")
     qce_dest = os.path.join(plugins_dir, "qq-chat-exporter")
     shutil.copytree("plugins/qq-chat-exporter", qce_dest)
+
+    volunteer_src = "plugins/qq-volunteer-apply"
+    volunteer_dest = os.path.join(plugins_dir, "qq-volunteer-apply")
+    if os.path.exists(volunteer_src):
+        shutil.copytree(volunteer_src, volunteer_dest)
+        print("[x] Copied qq-volunteer-apply")
+    else:
+        print("[-] qq-volunteer-apply not found, skip")
+
     print("[x] Done")
     print()
     
@@ -152,6 +161,11 @@ def main():
                     "name": "qq-chat-exporter",
                     "enable": True,
                     "path": "./plugins/qq-chat-exporter/index.mjs"
+                },
+                {
+                    "name": "qq-volunteer-apply",
+                    "enable": True,
+                    "path": "./plugins/qq-volunteer-apply/index.mjs"
                 }
             ]
         }

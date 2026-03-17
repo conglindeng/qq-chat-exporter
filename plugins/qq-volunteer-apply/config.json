@@ -1,0 +1,16 @@
+{
+  "adminQQ": "",
+  "whitelistGroups": [],
+  "recruitKeywords": [
+    "志愿者招募",
+    "招募志愿者",
+    "志愿者征集",
+    "志愿者报名"
+  ],
+  "defaultApplyText": "24计科1班张三",
+  "adminWindowMinutes": 30,
+  "listenAheadMinutes": 2,
+  "listenLateMinutes": 5,
+  "dedupHours": 24,
+  "timezone": "Asia/Shanghai"
+}

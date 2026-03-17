@@ -1,0 +1,8 @@
+{
+  "name": "qq-volunteer-apply",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "description": "NapCat plugin for volunteer recruitment auto apply"
+}

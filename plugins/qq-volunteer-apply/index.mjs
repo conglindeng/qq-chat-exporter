@@ -9,7 +9,7 @@ const DEFAULT_CONFIG = {
   adminQQ: '',
   whitelistGroups: [],
   recruitKeywords: ['志愿者招募', '招募志愿者', '志愿者征集', '志愿者报名'],
-  defaultApplyText: '24计科1班张三',
+  defaultApplyText: '25秘书转2班华雪',
   adminWindowMinutes: 30,
   listenAheadMinutes: 2,
   listenLateMinutes: 5,
@@ -36,6 +36,7 @@ const TERMINAL_STATUS = new Set([
 ]);
 
 let pluginInstance = null;
+let pluginInitializing = false; // 防止并发初始化
 
 function nowTs() {
   return Date.now();
@@ -92,8 +93,15 @@ function parseStartTime(rawText, baseTs = Date.now()) {
     const day = Number(m[2]);
     const hour = adjustAmPm(m[3] || '', Number(m[4]));
     const minute = m[5] ? Number(m[5]) : 0;
-    const d = new Date(now.getFullYear(), month, day, hour, minute, 0, 0);
-    if (d.getTime() < baseTs) d.setFullYear(d.getFullYear() + 1);
+    let d = new Date(now.getFullYear(), month, day, hour, minute, 0, 0);
+    if (d.getTime() < baseTs) {
+      // 如果日期已过，判断是否应该加一年
+      // 只有当月份比当前月份小2个月以上，或者月份相同但日期已过，才加一年
+      const monthDiff = month - now.getMonth();
+      if (monthDiff < -1 || (monthDiff === 0 && day < now.getDate())) {
+        d.setFullYear(d.getFullYear() + 1);
+      }
+    }
     return d.getTime();
   }
 
@@ -152,10 +160,12 @@ function parsePatchTime(input, baseTs = Date.now()) {
 }
 
 class VolunteerApplyPlugin {
-  constructor(bridge) {
+  constructor(bridge, skipEventSubscription = false) {
     this.bridge = bridge;
     this.interval = null;
     this.unsubscribers = [];
+    this.tickRunning = false; // 防止 tick 并发执行
+    this.skipEventSubscription = skipEventSubscription; // 跳过手动订阅（使用 plugin_onmessage 回调）
 
     this.configPath = path.join(__dirname, 'config.json');
     this.tasksPath = path.join(__dirname, 'tasks.json');
@@ -205,8 +215,12 @@ class VolunteerApplyPlugin {
   }
 
   saveAll() {
-    fs.writeFileSync(this.tasksPath, JSON.stringify({ tasks: this.tasks }, null, 2), 'utf8');
-    fs.writeFileSync(this.runtimePath, JSON.stringify(this.runtime, null, 2), 'utf8');
+    try {
+      fs.writeFileSync(this.tasksPath, JSON.stringify({ tasks: this.tasks }, null, 2), 'utf8');
+      fs.writeFileSync(this.runtimePath, JSON.stringify(this.runtime, null, 2), 'utf8');
+    } catch (error) {
+      this.error('保存状态文件失败:', error?.message || error);
+    }
   }
 
   getActiveTask() {
@@ -242,7 +256,10 @@ class VolunteerApplyPlugin {
   parseActivityKey(text) {
     const clean = normalizeText(text);
     const m = clean.match(/活动内容[：:]\s*(.+)/);
-    return m ? m[1].trim() : '';
+    if (!m) return '';
+    const activityKey = m[1].trim();
+    // 限制活动内容最大长度为 100 字符，防止恶意超长输入
+    return activityKey.slice(0, 100);
   }
 
   parseRecruit(text) {
@@ -367,8 +384,6 @@ class VolunteerApplyPlugin {
       `30分钟内回复：是 / 否 / 补时 yyyy-MM-dd HH:mm`,
       `取消任务：取消 ${task.activityKey}`
     ].join('\n'));
-
-    await this.tryImmediateMuteCheck(task);
   }
 
   parseAdminCommand(text) {
@@ -430,9 +445,12 @@ class VolunteerApplyPlugin {
         return;
       }
       task.finalStartTime = command.parsedTime;
+      // 同时更新监听窗口
+      task.listenWindowStart = task.finalStartTime - this.config.listenAheadMinutes * 60 * 1000;
+      task.listenWindowEnd = task.finalStartTime + this.config.listenLateMinutes * 60 * 1000;
       task.updatedAt = nowTs();
       this.saveAll();
-      await this.notifyAdmin(`已更新开始时间：${formatTs(task.finalStartTime)}`);
+      await this.notifyAdmin(`已更新开始时间：${formatTs(task.finalStartTime)}\n监听窗口：${formatTs(task.listenWindowStart)} ~ ${formatTs(task.listenWindowEnd)}`);
       return;
     }
 
@@ -566,41 +584,54 @@ class VolunteerApplyPlugin {
   }
 
   async tick() {
-    const task = this.getActiveTask();
-    if (!task || this.isTerminal(task.status)) return;
+    // 防止并发执行
+    if (this.tickRunning) return;
+    this.tickRunning = true;
+    try {
+      const task = this.getActiveTask();
+      if (!task || this.isTerminal(task.status)) return;
 
-    const now = nowTs();
-    if (task.status === TASK_STATUS.WAIT_ADMIN && now > task.adminWindowDeadline) {
-      task.status = TASK_STATUS.EXPIRED;
-      task.failReason = '管理员确认超时';
-      task.updatedAt = now;
-      this.runtime.activeTaskId = null;
-      this.saveAll();
-      await this.notifyAdmin(`任务结束：${task.status}\n活动内容：${task.activityKey}\n原因：${task.failReason}`);
-      return;
-    }
-
-    if (task.status === TASK_STATUS.READY) {
-      if (task.listenWindowStart && task.listenWindowEnd && now >= task.listenWindowStart && now <= task.listenWindowEnd) {
-        task.status = TASK_STATUS.WAIT_UNMUTE;
+      const now = nowTs();
+      if (task.status === TASK_STATUS.WAIT_ADMIN && now > task.adminWindowDeadline) {
+        task.status = TASK_STATUS.EXPIRED;
+        task.failReason = '管理员确认超时';
         task.updatedAt = now;
+        this.runtime.activeTaskId = null;
         this.saveAll();
-        await this.notifyAdmin(`已进入解禁监听窗口\n活动内容：${task.activityKey}\n窗口结束：${formatTs(task.listenWindowEnd)}`);
-        await this.tryImmediateMuteCheck(task);
+        await this.notifyAdmin(`任务结束：${task.status}\n活动内容：${task.activityKey}\n原因：${task.failReason}`);
+        return;
       }
-    }
 
-    if (task.status === TASK_STATUS.WAIT_UNMUTE && task.listenWindowEnd && now > task.listenWindowEnd) {
-      task.status = TASK_STATUS.EXPIRED;
-      task.failReason = '解禁等待超时';
-      task.updatedAt = now;
-      this.runtime.activeTaskId = null;
-      this.saveAll();
-      await this.notifyAdmin(`任务结束：${task.status}\n活动内容：${task.activityKey}\n原因：${task.failReason}`);
+      if (task.status === TASK_STATUS.READY) {
+        if (task.listenWindowStart && task.listenWindowEnd && now >= task.listenWindowStart && now <= task.listenWindowEnd) {
+          task.status = TASK_STATUS.WAIT_UNMUTE;
+          task.updatedAt = now;
+          this.saveAll();
+          await this.notifyAdmin(`已进入解禁监听窗口\n活动内容：${task.activityKey}\n窗口结束：${formatTs(task.listenWindowEnd)}`);
+          await this.tryImmediateMuteCheck(task);
+        }
+      }
+
+      if (task.status === TASK_STATUS.WAIT_UNMUTE && task.listenWindowEnd && now > task.listenWindowEnd) {
+        task.status = TASK_STATUS.EXPIRED;
+        task.failReason = '解禁等待超时';
+        task.updatedAt = now;
+        this.runtime.activeTaskId = null;
+        this.saveAll();
+        await this.notifyAdmin(`任务结束：${task.status}\n活动内容：${task.activityKey}\n原因：${task.failReason}`);
+      }
+    } finally {
+      this.tickRunning = false;
     }
   }
 
   subscribeEvents() {
+    // 如果使用 plugin_onmessage 回调方式，跳过手动订阅
+    if (this.skipEventSubscription) {
+      this.log('使用 plugin_onmessage 回调模式，跳过手动事件订阅');
+      return;
+    }
+
     const eventNames = [
       'message',
       'notice',
@@ -619,6 +650,7 @@ class VolunteerApplyPlugin {
       this.bridge?.instance?.events
     ].filter(Boolean);
 
+    let subscribedCount = 0;
     for (const emitter of candidates) {
       if (typeof emitter?.on !== 'function') continue;
       const hasOff = typeof emitter?.off === 'function' || typeof emitter?.removeListener === 'function';
@@ -628,6 +660,7 @@ class VolunteerApplyPlugin {
         };
         try {
           emitter.on(eventName, handler);
+          subscribedCount += 1;
           if (hasOff) {
             this.unsubscribers.push(() => {
               if (typeof emitter.off === 'function') emitter.off(eventName, handler);
@@ -636,6 +669,12 @@ class VolunteerApplyPlugin {
           }
         } catch (_) {}
       }
+    }
+
+    if (subscribedCount > 0) {
+      this.log(`手动订阅了 ${subscribedCount} 个事件源`);
+    } else {
+      this.warn('未能订阅任何事件源，请确保 NapCat 版本支持或使用 plugin_onmessage 回调');
     }
   }
 
@@ -693,12 +732,21 @@ export async function plugin_cleanup() {
 // 兼容 NapCat 新插件规范
 export async function plugin_onmessage(ctx, event) {
   try {
-    if (!pluginInstance) {
-      const bridge = buildBridge(ctx?.core, null, null, null, ctx);
-      pluginInstance = new VolunteerApplyPlugin(bridge);
-      await pluginInstance.start();
+    // 使用标志位防止并发初始化
+    if (!pluginInstance && !pluginInitializing) {
+      pluginInitializing = true;
+      try {
+        const bridge = buildBridge(ctx?.core, null, null, null, ctx);
+        // 使用 plugin_onmessage 回调时，跳过手动事件订阅，避免重复处理
+        pluginInstance = new VolunteerApplyPlugin(bridge, true);
+        await pluginInstance.start();
+      } finally {
+        pluginInitializing = false;
+      }
     }
-    await pluginInstance.onOneBotEvent(event);
+    if (pluginInstance) {
+      await pluginInstance.onOneBotEvent(event);
+    }
   } catch (error) {
     console.error('[VolunteerApply] plugin_onmessage 处理失败', error);
   }

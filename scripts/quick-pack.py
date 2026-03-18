@@ -9,9 +9,18 @@ import platform
 import subprocess
 import zipfile
 import tarfile
+import ssl
 from pathlib import Path
 from urllib.request import urlretrieve, urlopen
 from datetime import datetime
+
+# Fix SSL certificate verification on macOS
+try:
+    import certifi
+    ssl._create_default_https_context = lambda: ssl.create_default_context(cafile=certifi.where())
+except ImportError:
+    # Fallback: disable SSL verification (not recommended for production)
+    ssl._create_default_https_context = ssl._create_unverified_context
 
 def get_qce_version():
     """Get QCE version from package.json or environment variable"""
